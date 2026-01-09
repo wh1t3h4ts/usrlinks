@@ -1,0 +1,51 @@
+{
+  "GitHub": {
+    "url": "https://github.com/{username}",
+    "method": "status_code",
+    "code": [404],
+    "recon_enabled": true,
+    "api_endpoint": "https://api.github.com/users/{username}"
+  },
+  "Twitter": {
+    "url": "https://twitter.com/{username}",
+    "method": "response_text",
+    "error_msg": ["doesn't exist", "404"],
+    "recon_enabled": true
+  },
+  "Instagram": {
+    "url": "https://instagram.com/{username}",
+    "method": "status_code", 
+    "code": [404],
+    "recon_enabled": true
+  },
+  "Reddit": {
+    "url": "https://reddit.com/user/{username}",
+    "method": "status_code",
+    "code": [404],
+    "recon_enabled": true
+  },
+  "LinkedIn": {
+    "url": "https://linkedin.com/in/{username}",
+    "method": "status_code",
+    "code": [404],
+    "recon_enabled": true
+  },
+  "TikTok": {
+    "url": "https://tiktok.com/@{username}",
+    "method": "response_text",
+    "error_msg": ["Couldn't find this account"],
+    "recon_enabled": false
+  },
+  "YouTube": {
+    "url": "https://youtube.com/{username}",
+    "method": "response_text", 
+    "error_msg": ["This channel does not exist"],
+    "recon_enabled": false
+  },
+  "Twitch": {
+    "url": "https://twitch.tv/{username}",
+    "method": "status_code",
+    "code": [404],
+    "recon_enabled": false
+  }
+}

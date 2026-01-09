@@ -1,42 +1,51 @@
 #!/usr/bin/env python3
 """
 USRLINKS - Advanced OSINT Username Hunter
-Terminal-based tool to check username availability across 100+ platforms.
 
-This is intentionally designed as a command-line tool for:
-- Maximum portability and security
-- Integration with existing OSINT workflows  
-- Use in penetration testing environments
-- Automation and batch processing
-
-Web-based interfaces are maintained separately on the 'web-ui' branch.
+A comprehensive tool for checking username availability and gathering
+public profile data across multiple platforms.
 """
 
+import asyncio
+import argparse
+import csv
+import hashlib
+import itertools
+import json
+import logging
 import os
+import random
+import re
 import sys
 import time
-import json
-import csv
-import random
-import argparse
-import re
-import hashlib
+from collections import deque
 from datetime import datetime
 from urllib.parse import urlparse
-import requests
-from requests.adapters import HTTPAdapter, Retry
-from bs4 import BeautifulSoup
-from tqdm import tqdm
-import logging
 
-# try exception block
+import aiohttp
+import requests
+from bs4 import BeautifulSoup
+from rapidfuzz import fuzz
+from requests.adapters import HTTPAdapter, Retry
+from rich import box
+from rich.console import Console
+from rich.table import Table as RichTable
+from tqdm import tqdm
+
+# Optional dependencies
 try:
     from fake_useragent import UserAgent
     FAKE_UA_AVAILABLE = True
 except ImportError:
     FAKE_UA_AVAILABLE = False
 
-  # --- Logging Setup ----
+try:
+    from tabulate import tabulate
+    TABULATE_AVAILABLE = True
+except ImportError:
+    TABULATE_AVAILABLE = False
+
+# --- Logging Setup ---
 logging.basicConfig(
     filename="usrlinks.log",
     level=logging.INFO,
@@ -45,8 +54,9 @@ logging.basicConfig(
 
 
 
-# --- Styling & Terminal UI ---
+# --- Constants and Configuration ---
 class Colors:
+    """ANSI color codes for terminal output."""
     RED = "\033[1;31m"
     GREEN = "\033[1;32m"
     YELLOW = "\033[1;33m"
@@ -61,15 +71,26 @@ class Colors:
     PROGRESS_TEXT = "\033[1;36m"
     ERROR = "\033[1;31m"
 
+
+FALLBACK_UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
 class Table:
+    """Simple table formatter for terminal output."""
+    
     def __init__(self, headers):
         self.headers = headers
         self.rows = []
     
     def add_row(self, row):
+        """Add a row to the table."""
         self.rows.append(row)
     
     def display(self):
+        """Display the table with proper formatting."""
         col_widths = [len(header) for header in self.headers]
         for row in self.rows:
             for i, cell in enumerate(row):
@@ -90,6 +111,8 @@ class Table:
 
 # --- Enhanced Reconnaissance Class ---
 class EnhancedRecon:
+    """Advanced reconnaissance module for extracting profile information."""
+    
     def __init__(self, session):
         self.session = session
         self.email_patterns = [
@@ -106,7 +129,7 @@ class EnhancedRecon:
         ]
 
     def extract_contact_info(self, soup, url):
-        """Extract email addresses and phone numbers from profile pages"""
+        """Extract email addresses and phone numbers from profile pages."""
         contact_info = {
             'emails': [],
             'phones': [],
@@ -143,7 +166,7 @@ class EnhancedRecon:
         return contact_info
 
     def _extract_platform_specific(self, soup, url):
-        """Extract platform-specific information"""
+        """Extract platform-specific information."""
         info = {'location': None, 'bio': None, 'name': None, 'verified': False}
         
         if 'github.com' in url:
@@ -158,7 +181,7 @@ class EnhancedRecon:
         return info
 
     def _extract_github_info(self, soup):
-        """Extract GitHub-specific information"""
+        """Extract GitHub-specific information."""
         info = {}
         
         # Location
@@ -179,7 +202,7 @@ class EnhancedRecon:
         return info
 
     def _extract_twitter_info(self, soup):
-        """Extract Twitter/X-specific information"""
+        """Extract Twitter/X-specific information."""
         info = {}
         
         # Bio
@@ -199,7 +222,7 @@ class EnhancedRecon:
         return info
 
     def _extract_instagram_info(self, soup):
-        """Extract Instagram-specific information"""
+        """Extract Instagram-specific information."""
         info = {}
         
         # Bio (Instagram stores bio in meta tags)
@@ -210,7 +233,7 @@ class EnhancedRecon:
         return info
 
     def _extract_linkedin_info(self, soup):
-        """Extract LinkedIn-specific information"""
+        """Extract LinkedIn-specific information."""
         info = {}
         
         # Location
@@ -221,7 +244,7 @@ class EnhancedRecon:
         return info
 
     def extract_profile_image(self, soup, url):
-        """Extract profile image URL and generate hash"""
+        """Extract profile image URL and generate hash."""
         profile_image_info = {
             'url': None,
             'hash': None,
@@ -255,7 +278,7 @@ class EnhancedRecon:
         return profile_image_info
 
     def _generate_image_hash(self, img_url):
-        """Generate hash of profile image for comparison"""
+        """Generate hash of profile image for comparison."""
         try:
             response = self.session.get(img_url, timeout=10)
             if response.status_code == 200:
@@ -265,7 +288,7 @@ class EnhancedRecon:
         return None
 
     def generate_google_dorks(self, username):
-        """Generate Google search dorks for the username"""
+        """Generate Google search dorks for the username."""
         dorks = [
             f'"{username}"',
             f'"{username}" site:pastebin.com',
@@ -281,7 +304,7 @@ class EnhancedRecon:
         return dorks
 
 def load_platforms(config_path=None):
-    """Load platforms from JSON file or use built-in."""
+    """Load platforms from JSON file or use built-in configuration."""
     if config_path and os.path.isfile(config_path):
         with open(config_path, "r") as f:
             return json.load(f)
@@ -319,40 +342,135 @@ def load_platforms(config_path=None):
             "code": [404],
             "recon_enabled": True
         },
-        "TikTok": {"url": "https://tiktok.com/@{}", "method": "response_text", "error_msg": ["Couldn't find this account"]},
-        "YouTube": {"url": "https://youtube.com/{}", "method": "response_text", "error_msg": ["This channel does not exist"]},
-        "Twitch": {"url": "https://twitch.tv/{}", "method": "status_code", "code": [404]},
-        "Facebook": {"url": "https://facebook.com/{}", "method": "response_text", "error_msg": ["This page isn't available"]},
-        "Pinterest": {"url": "https://pinterest.com/{}", "method": "response_text", "error_msg": ["Sorry, we couldn't find that page"]},
-        "Steam": {"url": "https://steamcommunity.com/id/{}", "method": "response_text", "error_msg": ["The specified profile could not be found"]},
-        "Vimeo": {"url": "https://vimeo.com/{}", "method": "response_text", "error_msg": ["Sorry, we couldn't find that user"]},
-        "SoundCloud": {"url": "https://soundcloud.com/{}", "method": "response_text", "error_msg": ["Oops! We can't find that track"]},
-        "Medium": {"url": "https://medium.com/@{}", "method": "response_text", "error_msg": ["404"]},
-        "DeviantArt": {"url": "https://{}.deviantart.com", "method": "response_text", "error_msg": ["404"]},
-        "GitLab": {"url": "https://gitlab.com/{}", "method": "status_code", "code": [404]},
-        "Bitbucket": {"url": "https://bitbucket.org/{}", "method": "status_code", "code": [404]},
-        "Keybase": {"url": "https://keybase.io/{}", "method": "status_code", "code": [404]},
-        "HackerNews": {"url": "https://news.ycombinator.com/user?id={}", "method": "response_text", "error_msg": ["No such user"]},
-        "CodePen": {"url": "https://codepen.io/{}", "method": "response_text", "error_msg": ["Sorry, couldn't find that pen"]},
-        "Telegram": {"url": "https://t.me/{}", "method": "response_text", "error_msg": ["Telegram channel not found"]},
-        "Tumblr": {"url": "https://{}.tumblr.com", "method": "response_text", "error_msg": ["Nothing here"]},
-        "Spotify": {"url": "https://open.spotify.com/user/{}", "method": "response_text", "error_msg": ["Couldn't find that user"]},
-        "Last.fm": {"url": "https://last.fm/user/{}", "method": "response_text", "error_msg": ["Page not found"]},
-        "Roblox": {"url": "https://www.roblox.com/user.aspx?username={}", "method": "response_text", "error_msg": ["404"]},
-        "Quora": {"url": "https://www.quora.com/profile/{}", "method": "response_text", "error_msg": ["Oops! The page you were looking for doesn't exist"]},
-        "VK": {"url": "https://vk.com/{}", "method": "response_text", "error_msg": ["404"]},
-        "Imgur": {"url": "https://imgur.com/user/{}", "method": "response_text", "error_msg": ["404"]},
-        "Etsy": {"url": "https://www.etsy.com/shop/{}", "method": "response_text", "error_msg": ["404"]},
-        "Pastebin": {"url": "https://pastebin.com/u/{}", "method": "response_text", "error_msg": ["404"]},
+        "TikTok": {
+            "url": "https://tiktok.com/@{}",
+            "method": "response_text",
+            "error_msg": ["Couldn't find this account"]
+        },
+        "YouTube": {
+            "url": "https://youtube.com/{}",
+            "method": "response_text",
+            "error_msg": ["This channel does not exist"]
+        },
+        "Twitch": {
+            "url": "https://twitch.tv/{}",
+            "method": "status_code",
+            "code": [404]
+        },
+        "Facebook": {
+            "url": "https://facebook.com/{}",
+            "method": "response_text",
+            "error_msg": ["This page isn't available"]
+        },
+        "Pinterest": {
+            "url": "https://pinterest.com/{}",
+            "method": "response_text",
+            "error_msg": ["Sorry, we couldn't find that page"]
+        },
+        "Steam": {
+            "url": "https://steamcommunity.com/id/{}",
+            "method": "response_text",
+            "error_msg": ["The specified profile could not be found"]
+        },
+        "Vimeo": {
+            "url": "https://vimeo.com/{}",
+            "method": "response_text",
+            "error_msg": ["Sorry, we couldn't find that user"]
+        },
+        "SoundCloud": {
+            "url": "https://soundcloud.com/{}",
+            "method": "response_text",
+            "error_msg": ["Oops! We can't find that track"]
+        },
+        "Medium": {
+            "url": "https://medium.com/@{}",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
+        "DeviantArt": {
+            "url": "https://{}.deviantart.com",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
+        "GitLab": {
+            "url": "https://gitlab.com/{}",
+            "method": "status_code",
+            "code": [404]
+        },
+        "Bitbucket": {
+            "url": "https://bitbucket.org/{}",
+            "method": "status_code",
+            "code": [404]
+        },
+        "Keybase": {
+            "url": "https://keybase.io/{}",
+            "method": "status_code",
+            "code": [404]
+        },
+        "HackerNews": {
+            "url": "https://news.ycombinator.com/user?id={}",
+            "method": "response_text",
+            "error_msg": ["No such user"]
+        },
+        "CodePen": {
+            "url": "https://codepen.io/{}",
+            "method": "response_text",
+            "error_msg": ["Sorry, couldn't find that pen"]
+        },
+        "Telegram": {
+            "url": "https://t.me/{}",
+            "method": "response_text",
+            "error_msg": ["Telegram channel not found"]
+        },
+        "Tumblr": {
+            "url": "https://{}.tumblr.com",
+            "method": "response_text",
+            "error_msg": ["Nothing here"]
+        },
+        "Spotify": {
+            "url": "https://open.spotify.com/user/{}",
+            "method": "response_text",
+            "error_msg": ["Couldn't find that user"]
+        },
+        "Last.fm": {
+            "url": "https://last.fm/user/{}",
+            "method": "response_text",
+            "error_msg": ["Page not found"]
+        },
+        "Roblox": {
+            "url": "https://www.roblox.com/user.aspx?username={}",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
+        "Quora": {
+            "url": "https://www.quora.com/profile/{}",
+            "method": "response_text",
+            "error_msg": ["Oops! The page you were looking for doesn't exist"]
+        },
+        "VK": {
+            "url": "https://vk.com/{}",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
+        "Imgur": {
+            "url": "https://imgur.com/user/{}",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
+        "Etsy": {
+            "url": "https://www.etsy.com/shop/{}",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
+        "Pastebin": {
+            "url": "https://pastebin.com/u/{}",
+            "method": "response_text",
+            "error_msg": ["404"]
+        },
     }
 
-FALLBACK_UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-]
-
 def get_random_user_agent():
+    """Get a random user agent string."""
     if FAKE_UA_AVAILABLE:
         try:
             return UserAgent().random
@@ -360,7 +478,9 @@ def get_random_user_agent():
             pass
     return random.choice(FALLBACK_UA_LIST)
 
+
 def get_session_with_retries(proxy=None, tor=False):
+    """Create HTTP session with retry configuration and optional proxy."""
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -373,6 +493,7 @@ def get_session_with_retries(proxy=None, tor=False):
         "Referer": "https://www.google.com/",
         "DNT": "1",
     })
+    
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
     elif tor:
@@ -380,6 +501,7 @@ def get_session_with_retries(proxy=None, tor=False):
             "http": "socks5h://127.0.0.1:9050",
             "https": "socks5h://127.0.0.1:9050"
         }
+    
     return session
 
 def check_platform(session, username, platform, info, timeout=15, deep_scan=False):
@@ -624,24 +746,465 @@ def list_platforms(platforms):
         print(Colors.YELLOW + f"- {name} {Colors.CYAN}[Recon: {recon_status}]{Colors.RESET}")
 
 def print_result_table(results):
-    from tabulate import tabulate  # move to top if u wanto
+    """Print results in a formatted table."""
+    if TABULATE_AVAILABLE:
+        from tabulate import tabulate
+        table_data = []
+        for result in results:
+            status = (
+                "AVAILABLE" if result["available"] is True
+                else "TAKEN" if result["available"] is False
+                else "ERROR"
+            )
+            profile_url = result["url"] if result["available"] is False else "-"
+            table_data.append([result["platform"], status, profile_url])
 
-    table_data = []
-    for result in results:
-        status = (
-            "AVAILABLE" if result["available"] is True
-            else "TAKEN" if result["available"] is False
-            else "ERROR"
-        )
-        profile_url = result["url"] if result["available"] is False else "-"
-        table_data.append([result["platform"], status, profile_url])
+        headers = ["Platform", "Status", "Profile"]
+        print("\n" + Colors.CYAN + tabulate(table_data, headers=headers, tablefmt="github") + Colors.RESET)
+    else:
+        # Fallback to simple table if tabulate not available
+        table = Table(["Platform", "Status", "Profile"])
+        for result in results:
+            status = (
+                "AVAILABLE" if result["available"] is True
+                else "TAKEN" if result["available"] is False
+                else "ERROR"
+            )
+            profile_url = result["url"] if result["available"] is False else "-"
+            table.add_row([result["platform"], status, profile_url])
+        table.display()
 
-    headers = ["Platform", "Status", "Profile"]
-    print("\n" + Colors.CYAN + tabulate(table_data, headers=headers, tablefmt="github") + Colors.RESET)
+def generate_username_variants(username):
+    """Generate leet/fuzzy variants of a username."""
+    leet_map = {
+        'a': ['4', '@'], 'e': ['3'], 'i': ['1'], 'o': ['0'], 's': ['5'], 't': ['7'],
+        'A': ['4', '@'], 'E': ['3'], 'I': ['1'], 'O': ['0'], 'S': ['5'], 'T': ['7']
+    }
+    variants = set()
+
+    # leet replacements
+    def leetify(s):
+        out = set()
+        chars = list(s)
+        for i, c in enumerate(chars):
+            if c in leet_map:
+                for l in leet_map[c]:
+                    new = chars[:]
+                    new[i] = l
+                    out.add(''.join(new))
+        return out
+
+    # remove/replace underscores/dots
+    def underscore_dot_variants(s):
+        out = set()
+        if '_' in s:
+            out.add(s.replace('_', ''))
+            out.add(s.replace('_', '-'))
+        if '.' in s:
+            out.add(s.replace('.', ''))
+            out.add(s.replace('.', '-'))
+        return out
+
+    # Duplicate letters (max twice in a row)
+    def duplicate_letters(s):
+        out = set()
+        for i in range(len(s)):
+            out.add(s[:i+1] + s[i] + s[i+1:])
+        return out
+
+    # Swap adjacent letters
+    def swap_adjacent(s):
+        out = set()
+        chars = list(s)
+        for i in range(len(chars)-1):
+            swapped = chars[:]
+            swapped[i], swapped[i+1] = swapped[i+1], swapped[i]
+            out.add(''.join(swapped))
+        return out
+
+    # Append/prepend numbers
+    def add_numbers(s):
+        out = set()
+        for n in range(1, 10):
+            out.add(f"{s}{n}")
+            out.add(f"{n}{s}")
+        return out
+
+    # Collect all variants
+    variants.update(leetify(username))
+    variants.update(underscore_dot_variants(username))
+    variants.update(duplicate_letters(username))
+    variants.update(swap_adjacent(username))
+    variants.update(add_numbers(username))
+
+    # Combine some rules for more variants
+    for v in list(variants):
+        variants.update(leetify(v))
+        variants.update(underscore_dot_variants(v))
+        variants.update(duplicate_letters(v))
+        variants.update(swap_adjacent(v))
+        variants.update(add_numbers(v))
+
+    # Remove original username and deduplicate
+    variants.discard(username)
+    
+    # Use a queue for breadth-first generation to avoid exponential growth
+    queue = deque()
+    queue.append(username)
+    seen = set([username])
+
+    # Apply transformations breadth-first, limit depth to avoid exponential blowup
+    max_depth = 2
+    depth = 0
+    while queue and depth < max_depth:
+        next_queue = deque()
+        while queue:
+            current = queue.popleft()
+            for func in (leetify, underscore_dot_variants, duplicate_letters, swap_adjacent, add_numbers):
+                for v in func(current):
+                    if v not in seen:
+                        variants.add(v)
+                        next_queue.append(v)
+                        seen.add(v)
+        queue = next_queue
+        depth += 1
+
+    # Remove original username and deduplicate
+    variants.discard(username)
+    return list(variants)
+
+def run_fuzzy_scan(username, platforms, proxy=None, tor=False, threads=10, timeout=15, deep_scan=False, fuzzy_all=False):
+    console = Console()
+    variants = generate_username_variants(username)
+    if not variants:
+        console.print("[yellow][*] No variants generated for fuzzy scan.[/yellow]")
+        return
+
+    # 1. Detecting -f flag and interactive selection unless --fuzzy-all
+    selected_platforms = []
+    platform_names = list(platforms.keys())
+    if not fuzzy_all:
+        print(Colors.YELLOW + "[!] -f (fuzzy scan) detected.\n"
+              "Fuzzing will generate many username variants and check them across platforms.\n"
+              "This can take a long time because it multiplies:\n"
+              "    variants × platforms\n"
+              "Recommended: Select only 1–2 platforms to test before doing a full run.\n\n"
+              "You will:\n"
+              "  1. Choose [y/n] for each default platform.\n"
+              "  2. Optionally add custom platform URLs.\n"
+              "  3. Confirm before fuzzing starts.\n\n"
+              "Type 'ok' to continue, or 'n' to cancel." + Colors.RESET)
+        while True:
+            user_input = input("> ").strip().lower()
+            if user_input == "ok":
+                break
+            elif user_input == "n":
+                print(Colors.YELLOW + "[*] Fuzzy scan cancelled by user." + Colors.RESET)
+                return
+            else:
+                print(Colors.RED + "[!] Invalid input. Please type 'ok' to proceed or 'n' to cancel." + Colors.RESET)
+
+        # 2. Interactive default platform selection
+        for pname in platform_names:
+            while True:
+                choice = input(f"[?] Do you want to fuzz {pname}? [y/n]: ").strip().lower()
+                if choice == "y":
+                    selected_platforms.append(pname)
+                    break
+                elif choice == "n":
+                    break
+                else:
+                    print(Colors.RED + "[!] Invalid choice. Type 'y' for yes or 'n' for no." + Colors.RESET)
+
+        # 3. Optional custom URLs
+        while True:
+            custom = input("[?] Any custom platform URL to fuzz? Enter URL or 'n' for none: ").strip()
+            if custom.lower() == "n":
+                break
+            elif custom:
+                selected_platforms.append(custom)
+                while True:
+                    more = input("[?] Any more custom platforms? Enter URL or 'n' for none: ").strip()
+                    if more.lower() == "n":
+                        break
+                    elif more:
+                        selected_platforms.append(more)
+                    else:
+                        print(Colors.RED + "[!] Please enter a valid URL or 'n' for none." + Colors.RESET)
+                break
+            else:
+                print(Colors.RED + "[!] Please enter a valid URL or 'n' for none." + Colors.RESET)
+
+        # 4. Final confirmation
+        print(Colors.GREEN + "[+] Selected platforms for fuzzy scan:")
+        for p in selected_platforms:
+            print("   ", p)
+        print("\nProceed with fuzzing? [y/n]:" + Colors.RESET)
+        while True:
+            confirm = input("> ").strip().lower()
+            if confirm == "y":
+                break
+            elif confirm == "n":
+                print(Colors.YELLOW + "[*] Fuzzy scan cancelled by user." + Colors.RESET)
+                return
+            else:
+                print(Colors.RED + "[!] Invalid choice. Type 'y' for yes or 'n' to cancel." + Colors.RESET)
+    else:
+        selected_platforms = platform_names
+
+    # 5. Fuzzy scan execution
+    console.print("\n[bold green][*] Starting Advanced Username Fuzz Scan...[/bold green]\n")
+    results = []
+    session = get_session_with_retries(proxy, tor)
+    for platform in selected_platforms:
+        # If custom URL, use default GET logic
+        if platform in platforms:
+            info = platforms[platform]
+        else:
+            info = {"url": platform, "method": "status_code", "code": [404], "error_msg": ["404"]}
+        for variant in variants:
+            console.print(f"[cyan][+] Scanning {platform} for variant '{variant}'[/cyan]")
+            try:
+                url = info["url"].format(variant)
+                session.headers["User-Agent"] = get_random_user_agent()
+                response = session.get(url, timeout=timeout)
+                found = False
+                found_username = variant
+                if info["method"] == "status_code":
+                    if response.status_code not in info.get("code", [404]):
+                        found = True
+                elif info["method"] == "response_text":
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    page_text = soup.get_text().lower()
+                    error_msgs = [msg.lower() for msg in info.get("error_msg", ["404"])]
+                    if not any(msg in page_text for msg in error_msgs):
+                        found = True
+                if found:
+                    score = fuzz.ratio(username, found_username)
+                    results.append({
+                        "platform": platform,
+                        "found_username": found_username,
+                        "similarity": score,
+                        "profile_url": url
+                    })
+            except Exception:
+                continue
+
+    # Print results table
+    if results:
+        table = RichTable(title="[bold magenta]Fuzzy Scan Results[/bold magenta]", box=box.DOUBLE_EDGE)
+        table.add_column("Platform", style="bold cyan")
+        table.add_column("Found Username", style="bold white")
+        table.add_column("Similarity", style="bold white")
+        table.add_column("Profile URL", style="bold white")
+        for r in results:
+            sim = r["similarity"]
+            if sim >= 80:
+                sim_str = f"[bold green]{sim}%[/bold green]"
+            elif sim >= 60:
+                sim_str = f"[bold yellow]{sim}%[/bold yellow]"
+            else:
+                sim_str = f"[bold red]{sim}%[/bold red]"
+            table.add_row(
+                f"[cyan]{r['platform']}[/cyan]",
+                f"[white]{r['found_username']}[/white]",
+                sim_str,
+                f"[blue]{r['profile_url']}[/blue]"
+            )
+        console.print(table)
+        console.print(f"\n[bold green][*] Fuzzy scan completed: {len(results)} matches found[/bold green]\n")
+    else:
+        console.print("[yellow][*] No fuzzy matches found.[/yellow]")
+
+def parse_metadata_github(soup):
+    return {
+        "display_name": soup.find("span", {"itemprop": "name"}).get_text(strip=True) if soup.find("span", {"itemprop": "name"}) else "N/A",
+        "bio": soup.find("div", class_="user-profile-bio").get_text(strip=True) if soup.find("div", class_="user-profile-bio") else "N/A",
+        "location": soup.find("li", {"itemprop": "homeLocation"}).get_text(strip=True) if soup.find("li", {"itemprop": "homeLocation"}) else "N/A",
+        "followers": soup.find("a", href=lambda x: x and x.endswith("?tab=followers")).get_text(strip=True) if soup.find("a", href=lambda x: x and x.endswith("?tab=followers")) else "N/A",
+        "following": soup.find("a", href=lambda x: x and x.endswith("?tab=following")).get_text(strip=True) if soup.find("a", href=lambda x: x and x.endswith("?tab=following")) else "N/A",
+        "posts": "N/A",
+        "profile_image_url": soup.find("img", class_="avatar-user")["src"] if soup.find("img", class_="avatar-user") else "N/A",
+        "joined_date": soup.find("li", {"itemprop": "dateJoined"}).get_text(strip=True) if soup.find("li", {"itemprop": "dateJoined"}) else "N/A",
+        "verified_status": "N/A"
+    }
+
+def parse_metadata_twitter(soup):
+    return {
+        "display_name": soup.find("div", {"data-testid": "UserName"}).get_text(strip=True) if soup.find("div", {"data-testid": "UserName"}) else "N/A",
+        "bio": soup.find("div", {"data-testid": "UserDescription"}).get_text(strip=True) if soup.find("div", {"data-testid": "UserDescription"}) else "N/A",
+        "location": soup.find("span", {"data-testid": "UserLocation"}).get_text(strip=True) if soup.find("span", {"data-testid": "UserLocation"}) else "N/A",
+        "followers": soup.find("a", href=lambda x: x and "/followers" in x).get_text(strip=True) if soup.find("a", href=lambda x: x and "/followers" in x) else "N/A",
+        "following": soup.find("a", href=lambda x: x and "/following" in x).get_text(strip=True) if soup.find("a", href=lambda x: x and "/following" in x) else "N/A",
+        "posts": "N/A",
+        "profile_image_url": soup.find("img", {"alt": "Image"}).get("src") if soup.find("img", {"alt": "Image"}) else "N/A",
+        "joined_date": soup.find("span", string=lambda x: x and "Joined" in x).get_text(strip=True) if soup.find("span", string=lambda x: x and "Joined" in x) else "N/A",
+        "verified_status": "Yes" if soup.find("svg", {"data-testid": "verificationBadge"}) else "No"
+    }
+
+def parse_metadata_instagram(soup):
+    meta = lambda prop: soup.find("meta", property=prop)
+    return {
+        "display_name": meta("og:title")["content"] if meta("og:title") else "N/A",
+        "bio": meta("og:description")["content"] if meta("og:description") else "N/A",
+        "location": "N/A",
+        "followers": "N/A",
+        "following": "N/A",
+        "posts": "N/A",
+        "profile_image_url": meta("og:image")["content"] if meta("og:image") else "N/A",
+        "joined_date": "N/A",
+        "verified_status": "N/A"
+    }
+
+def parse_metadata_default(soup):
+    return {
+        "display_name": "N/A",
+        "bio": "N/A",
+        "location": "N/A",
+        "followers": "N/A",
+        "following": "N/A",
+        "posts": "N/A",
+        "profile_image_url": "N/A",
+        "joined_date": "N/A",
+        "verified_status": "N/A"
+    }
+
+PLATFORM_METADATA_PARSERS = {
+    "GitHub": parse_metadata_github,
+    "Twitter": parse_metadata_twitter,
+    "Instagram": parse_metadata_instagram,
+}
+
+async def fetch_metadata(session, platform, url):
+    try:
+        headers = {"User-Agent": get_random_user_agent()}
+        async with session.get(url, timeout=15, headers=headers) as resp:
+            html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+            parser = PLATFORM_METADATA_PARSERS.get(platform, parse_metadata_default)
+            meta = parser(soup)
+            return (platform, meta)
+    except Exception:
+        return (platform, None)
+
+async def extract_metadata_async(platform_url_pairs, concurrency=3):
+    results = []
+    sem = asyncio.Semaphore(concurrency)
+    async with aiohttp.ClientSession() as session:
+        async def sem_fetch(platform, url):
+            async with sem:
+                return await fetch_metadata(session, platform, url)
+        tasks = [sem_fetch(platform, url) for platform, url in platform_url_pairs]
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            results.append(result)
+    return results
+
+def display_metadata_table(meta_results):
+    """
+    Display metadata extraction results in a clean vertical table per account.
+    Each account/platform is shown as a block with field/value pairs.
+    """
+    console = Console()
+    if not meta_results:
+        console.print("[yellow][*] No metadata results to display.[/yellow]")
+        return
+
+    for platform, meta in meta_results:
+        console.print(f"\n[bold magenta]Platform:[/bold magenta] [cyan]{platform}[/cyan]")
+        if meta is None:
+            console.print("[red]  [-] Failed to retrieve metadata[/red]")
+            continue
+        table = RichTable(show_header=False, box=box.SIMPLE, expand=False, padding=(0,1))
+        table.add_row("[bold]Display Name[/bold]", meta.get("display_name", "N/A"))
+        table.add_row("[bold]Bio[/bold]", meta.get("bio", "N/A"))
+        table.add_row("[bold]Location[/bold]", meta.get("location", "N/A"))
+        table.add_row("[bold]Followers[/bold]", meta.get("followers", "N/A"))
+        table.add_row("[bold]Following[/bold]", meta.get("following", "N/A"))
+        table.add_row("[bold]Posts[/bold]", meta.get("posts", "N/A"))
+        table.add_row("[bold]Joined[/bold]", meta.get("joined_date", "N/A"))
+        table.add_row("[bold]Verified[/bold]", meta.get("verified_status", "N/A"))
+        table.add_row("[bold]Profile Image URL[/bold]", meta.get("profile_image_url", "N/A"))
+        console.print(table)
+    print()  # Extra newline after all blocks
+
+def prompt_custom_urls():
+    urls = []
+    while True:
+        custom = input("[?] Add custom platform URL to check? Enter URL or 'n' for none: ").strip()
+        if custom.lower() == "n":
+            break
+        elif custom:
+            urls.append(custom)
+        else:
+            print(Colors.RED + "[!] Please enter a valid URL or 'n' for none." + Colors.RESET)
+    return urls
+
+def prompt_platform_selection(platforms):
+    selected = []
+    for p in platforms:
+        while True:
+            ans = input(f"Extract metadata from {p}? [y/n]: ").strip().lower()
+            if ans == "y":
+                selected.append(p)
+                break
+            elif ans == "n":
+                break
+            else:
+                print(Colors.RED + "[!] Invalid choice. Type 'y' for yes or 'n' for no." + Colors.RESET)
+    return selected
+
+def run_metadata_extraction(confirmed_hits, platforms):
+    """Run metadata extraction with interactive platform selection."""
+    count = len(confirmed_hits)
+    platform_url_pairs = []
+    custom_urls = []
+
+    if count == 0:
+        print(Colors.YELLOW + "[*] No confirmed accounts to extract metadata from." + Colors.RESET)
+        return
+
+    if count <= 5:
+        print(Colors.GREEN + f"[+] Metadata extraction detected for up to {count} platforms." + Colors.RESET)
+        while True:
+            ans = input("Do you want to add extra custom platform URL(s) to check? [y/n]: ").strip().lower()
+            if ans == "y":
+                custom_urls = prompt_custom_urls()
+                break
+            elif ans == "n":
+                break
+            else:
+                print(Colors.RED + "[!] Invalid choice. Type 'y' for yes or 'n' to cancel." + Colors.RESET)
+        platform_url_pairs = [(p, url) for p, url in confirmed_hits.items()]
+        for url in custom_urls:
+            platform_url_pairs.append((url, url))
+    else:
+        print(Colors.YELLOW + "[-] Metadata extraction may take extra time depending on platform speed and rate limits." + Colors.RESET)
+        while True:
+            ans = input("Proceed with all platforms? [y/n]: ").strip().lower()
+            if ans == "y":
+                platform_url_pairs = [(p, url) for p, url in confirmed_hits.items()]
+                break
+            elif ans == "n":
+                selected = prompt_platform_selection(list(confirmed_hits.keys()))
+                platform_url_pairs = [(p, confirmed_hits[p]) for p in selected]
+                custom_urls = prompt_custom_urls()
+                for url in custom_urls:
+                    platform_url_pairs.append((url, url))
+                break
+            else:
+                print(Colors.RED + "[!] Invalid choice. Type 'y' for yes or 'n' to cancel." + Colors.RESET)
+
+    print(Colors.MAGENTA + "\n[+] Starting metadata extraction...\n" + Colors.RESET)
+    try:
+        meta_results = asyncio.run(extract_metadata_async(platform_url_pairs))
+        display_metadata_table(meta_results)
+    except Exception as e:
+        print(Colors.RED + f"[!] Error during metadata extraction: {e}" + Colors.RESET)
 
 def main():
     parser = argparse.ArgumentParser(description="USRLINKS - OSINT Username Hunter")
-    parser.add_argument("-u", "--username", help="Username to scan")
+    parser.add_argument("-u", "--username", help="Target username to scan", required=True)
     parser.add_argument("-p", "--proxy", help="HTTP/SOCKS proxy (e.g., http://127.0.0.1:8080)")
     parser.add_argument("-t", "--tor", action="store_true", help="Use Tor for anonymity")
     parser.add_argument("-th", "--threads", type=int, default=10, help="Number of threads (default: 10)")
@@ -650,32 +1213,36 @@ def main():
     parser.add_argument("--list-platforms", action="store_true", help="List supported platforms and exit")
     parser.add_argument("--deep-scan", action="store_true", help="Perform deep reconnaissance on found profiles")
     parser.add_argument("--generate-dorks", action="store_true", help="Generate Google dorks for the username")
-    
+    parser.add_argument("-f", "--fuzzy", action="store_true", help="Run advanced fuzzy username scan after normal scan")
+    parser.add_argument("--fuzzy-all", action="store_true", help="(Dangerous) Fuzz all platforms without prompt")
+    parser.add_argument("-r", "--retry", action="store_true", help="Retry failed requests after normal scan")
+    parser.add_argument("-m", "--metadata", action="store_true", help="Enable profile metadata extraction for confirmed accounts after scan.")
+
     args = parser.parse_args()
     platforms = load_platforms(args.platforms)
-    
+
     if args.list_platforms:
         list_platforms(platforms)
         sys.exit(0)
-    
+
     if args.generate_dorks:
         if not args.username:
             print(Colors.RED + "[-] Username required for dork generation")
             sys.exit(1)
         generate_dorks(args.username)
         sys.exit(0)
-    
+
     if not args.username:
         parser.print_help()
         sys.exit(1)
-    
+
     display_banner()
-    
+
     if args.deep_scan:
         print(Colors.YELLOW + f"[*] Deep scanning enabled - extracting profile information...\n")
-    
+
     print(Colors.YELLOW + f"[*] Scanning for username: {args.username}...\n")
-    
+
     results = scan_usernames(
         username=args.username,
         platforms=platforms,
@@ -684,44 +1251,62 @@ def main():
         threads=args.threads,
         deep_scan=args.deep_scan
     )
-    
+
     print_result_table(results)  # show initial results table
 
-    # retry failed platforms 2 times again
-    failed_results = [r for r in results if r["available"] is None]
-    session = get_session_with_retries(args.proxy, args.tor)
-    if failed_results:
-        from tqdm import tqdm
-        for attempt in range(2):
-            tqdm.write(f"\n[⏳] Retrying failed platforms (Attempt {attempt + 1}/2)")
-            retry_results = []
-            for fr in failed_results:
-                tqdm.write(f"[•] Retrying {fr['platform']}...")
-                retry_result = check_platform(session, args.username, fr['platform'], platforms[fr['platform']], timeout=15)
-                retry_results.append(retry_result)
-
-                if retry_result["available"] is True:
-                    tqdm.write(f"[✓] {fr['platform']}: Available")
-                elif retry_result["available"] is False:
-                    tqdm.write(f"[✗] {fr['platform']}: Taken")
-                else:
-                    tqdm.write(f"[!] {fr['platform']}: Still error")
-
-            print_result_table(retry_results)
-            failed_results = [r for r in retry_results if r["available"] is None]
-
-            if not failed_results:
-                tqdm.write("[✓] All platforms resolved after retries.")
-                break
-
+    # Only retry if --retry is passed
+    if args.retry:
+        failed_results = [r for r in results if r["available"] is None]
+        session = get_session_with_retries(args.proxy, args.tor)
         if failed_results:
-            failed_names = [r["platform"] for r in failed_results]
-            tqdm.write(f"[*] Still failing after 2 retries: {failed_names}")
+            from tqdm import tqdm
+            for attempt in range(2):
+                tqdm.write(f"\n[⏳] Retrying failed platforms (Attempt {attempt + 1}/2)")
+                retry_results = []
+                for fr in failed_results:
+                    tqdm.write(f"[•] Retrying {fr['platform']}...")
+                    retry_result = check_platform(session, args.username, fr['platform'], platforms[fr['platform']], timeout=15)
+                    retry_results.append(retry_result)
+
+                    if retry_result["available"] is True:
+                        tqdm.write(f"[✓] {fr['platform']}: Available")
+                    elif retry_result["available"] is False:
+                        tqdm.write(f"[✗] {fr['platform']}: Taken")
+                    else:
+                        tqdm.write(f"[!] {fr['platform']}: Still error")
+
+                print_result_table(retry_results)
+                failed_results = [r for r in retry_results if r["available"] is None]
+
+                if not failed_results:
+                    tqdm.write("[✓] All platforms resolved after retries.")
+                    break
+
+            if failed_results:
+                failed_names = [r["platform"] for r in failed_results]
+                tqdm.write(f"[*] Still failing after 2 retries: {failed_names}")
 
     display_results(results, args.username, args.deep_scan)
-    
+
     if args.output:
         save_results(results, args.username, args.output)
+
+    # Metadata extraction logic (interactive, after showing results)
+    if getattr(args, "metadata", False):
+        confirmed_hits = {r["platform"]: r["url"] for r in results if r["available"] is False or (r["available"] is None and r.get("url"))}
+        run_metadata_extraction(confirmed_hits, platforms)
+
+    # Fuzzy scan last if requested
+    if args.fuzzy:
+        run_fuzzy_scan(
+            username=args.username,
+            platforms=platforms,
+            proxy=args.proxy,
+            tor=args.tor,
+            threads=args.threads,
+            deep_scan=args.deep_scan,
+            fuzzy_all=getattr(args, "fuzzy_all", False)
+        )
 
 if __name__ == "__main__":
     try:
